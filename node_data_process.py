@@ -7,6 +7,16 @@ import torch
 import torch.nn as nn
 import torch.tensor as tensor
 from torch.nn.utils.rnn import pad_sequence, pack_sequence, pad_packed_sequence, pack_padded_sequence
+import adabound
+
+# torch.cuda.is_available() checks and returns a Boolean True if a GPU is available, else it'll return False
+is_cuda = torch.cuda.is_available()
+
+# If we have a GPU available, we'll set our device to GPU. We'll use this device variable later in our code.
+if is_cuda:
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 
 
 def data_filter():
@@ -54,8 +64,12 @@ def preprocess(df):
         cluster_sequence = df_route['cluster'].values
         cluster_idx_sequence = [cluster_to_idx[cluster] for cluster in cluster_sequence]
 
-        sentiment_sequence_list.append(tensor(sentiment_sequence, dtype=torch.float32))
-        cluster_idx_sequence_list.append(tensor(cluster_idx_sequence))
+        sentiment_sequence_list.append(
+            tensor(sentiment_sequence, dtype=torch.float32).to(device)
+        )
+        cluster_idx_sequence_list.append(
+            tensor(cluster_idx_sequence).to(device)
+        )
 
     choice_index = np.random.choice(
         len(sentiment_sequence_list),
@@ -72,8 +86,8 @@ def preprocess(df):
     cluster_idx_sequence_list_valid = [cluster_idx_sequence for index, cluster_idx_sequence in
                                        enumerate(cluster_idx_sequence_list) if index in choice_index]
 
-    sentiment_result_list_train = [sentiment_sequence[0] for sentiment_sequence in sentiment_sequence_list_train]
-    sentiment_result_list_valid = [sentiment_sequence[0] for sentiment_sequence in sentiment_sequence_list_valid]
+    sentiment_result_list_train = [sentiment_sequence[-1] for sentiment_sequence in sentiment_sequence_list_train]
+    sentiment_result_list_valid = [sentiment_sequence[-1] for sentiment_sequence in sentiment_sequence_list_valid]
 
     from torch.nn.utils.rnn import pack_sequence
     packed = pack_sequence(cluster_idx_sequence_list_train, enforce_sorted=False)
@@ -90,7 +104,7 @@ def preprocess(df):
     )
 
 
-def model_pipline(sentiment_sequence, cluster_idx_sequence):
+def model_pipeline(sentiment_sequence, cluster_idx_sequence):
     embedding_input = 9
     embedding_dimension = 5
     lstm_hidden_dimension = 6
@@ -130,14 +144,14 @@ class Model(nn.Module):
         # 提取cluster序列最后一列，转为张量，进行嵌入
         cluster_idx_last_list = [cluster_idx_sequence_tensor[-1] for cluster_idx_sequence_tensor in
                                  cluster_idx_sequence_list]
-        cluster_idx_last = tensor(cluster_idx_last_list)
+        cluster_idx_last = tensor(cluster_idx_last_list, device=device)
         linear_input_embedding = self.embedding_layer(cluster_idx_last)
 
         # 获取序列长度
         seq_len = [len(sentiment_sequence_tensor) for sentiment_sequence_tensor in sentiment_sequence_list]
 
         # padding + embedding
-        sentiment_padded_sequence = pad_sequence(sentiment_sequence_list, batch_first=True)
+        sentiment_padded_sequence = pad_sequence(sentiment_sequence_list, batch_first=True).unsqueeze(-1)
         cluster_idx_padded_sequence = pad_sequence(cluster_idx_sequence_list, batch_first=True)
         cluster_embedding_padded_sequence = self.embedding_layer(cluster_idx_padded_sequence)
 
@@ -146,10 +160,11 @@ class Model(nn.Module):
             (sentiment_padded_sequence, cluster_embedding_padded_sequence),
             dim=-1
         )
-        cat_packed_tensor = pack_padded_sequence(cat_padded_tensor, seq_len, batch_first=True)
+        cat_packed_tensor = pack_padded_sequence(cat_padded_tensor, seq_len, enforce_sorted=False, batch_first=True)
 
         lstm_out, (lstm_hidden, lstm_cell) = self.lstm_layer(cat_packed_tensor)
-        linear_input = torch.cat([lstm_hidden, linear_input_embedding], dim=-1).flatten(1)
+
+        linear_input = torch.cat([lstm_hidden.flatten(0, 1), linear_input_embedding], dim=-1).flatten(1)
         linear_out = self.linear_layer(linear_input)
 
         return linear_out
@@ -164,40 +179,50 @@ def train(
     lstm_hidden_dimension = 6
 
     model = Model(embedding_input, embedding_dimension, lstm_hidden_dimension)
+    model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    optimizer = adabound.AdaBound(model.parameters(), lr=1e-3, final_lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 400)
     loss_func = nn.MSELoss()
+
+    y_true_valid = tensor(sentiment_result_list_valid)
 
     def model_evaluate():
         from sklearn.metrics import r2_score
         with torch.no_grad():
             y_predict_list = model(sentiment_sequence_list_valid, cluster_idx_sequence_list_valid)
-        y_true_list = sentiment_result_list_valid
-        r2 = r2_score(y_true_list, y_predict_list)
+        r2 = r2_score(y_true_valid, y_predict_list.cpu())
         print(r2)
         return r2
 
-    for epoch in range(500):
+    y_true = tensor(sentiment_result_list_train, device=device).unsqueeze(-1)
+    for epoch in range(1600):
         optimizer.zero_grad()
         output = model(sentiment_sequence_list_train, cluster_idx_sequence_list_train)
-        loss = loss_func(output, sentiment_result_list_train)
-        loss_sum = loss.sum()
-        loss_sum.backward()
+        loss = loss_func(output, y_true)
+        loss.backward()
         optimizer.step()
 
-        print(f'loss in epoch {epoch}: {loss.average().item()}')
-        print('evaluate:')
-        model_evaluate()
-        scheduler.step()
+        if epoch % 50 == 49:
+            print(f'loss in epoch {epoch}: {loss.item()}')
+            print('evaluate:')
+            model_evaluate()
+            scheduler.step()
 
     print()
 
 
 def main():
     df = data_filter()
-    preprocess(df)
+    (
+        sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
+        sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
+    ) = preprocess(df)
+    train(
+        sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
+        sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
+    )
 
 
 if __name__ == '__main__':
