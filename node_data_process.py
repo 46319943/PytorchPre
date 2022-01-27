@@ -127,11 +127,11 @@ def model_pipeline(sentiment_sequence, cluster_idx_sequence):
 
 
 class Model(nn.Module):
-    def __init__(self, embedding_input, embedding_dimension, lstm_hidden_dimension):
+    def __init__(self, embedding_input, embedding_dimension, lstm_hidden_dimension, num_layers):
         super(Model, self).__init__()
         self.embedding_layer = nn.Embedding(embedding_input, embedding_dimension)
-        self.lstm_layer = nn.LSTM(embedding_dimension + 1, lstm_hidden_dimension, batch_first=True)
-        self.linear_layer = nn.Linear(lstm_hidden_dimension + embedding_dimension, 1)
+        self.lstm_layer = nn.LSTM(embedding_dimension + 1, lstm_hidden_dimension, num_layers, batch_first=True)
+        self.linear_layer = nn.Linear(lstm_hidden_dimension * num_layers + embedding_dimension, 1)
 
     def forward(self, sentiment_sequence_list, cluster_idx_sequence_list):
         # 分离输入。
@@ -164,7 +164,7 @@ class Model(nn.Module):
 
         lstm_out, (lstm_hidden, lstm_cell) = self.lstm_layer(cat_packed_tensor)
 
-        linear_input = torch.cat([lstm_hidden.flatten(0, 1), linear_input_embedding], dim=-1).flatten(1)
+        linear_input = torch.cat([lstm_hidden.permute(1, 0, 2).flatten(-2), linear_input_embedding], dim=-1).flatten(1)
         linear_out = self.linear_layer(linear_input)
 
         return linear_out
@@ -177,8 +177,9 @@ def train(
     embedding_input = 9
     embedding_dimension = 5
     lstm_hidden_dimension = 6
+    num_layers = 1
 
-    model = Model(embedding_input, embedding_dimension, lstm_hidden_dimension)
+    model = Model(embedding_input, embedding_dimension, lstm_hidden_dimension, num_layers)
     model.to(device)
 
     # optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
