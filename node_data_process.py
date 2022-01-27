@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.tensor as tensor
+from torch.nn.utils.rnn import pad_sequence, pack_sequence, pad_packed_sequence, pack_padded_sequence
 
 
 def data_filter():
@@ -71,11 +72,26 @@ def preprocess(df):
     cluster_idx_sequence_list_valid = [cluster_idx_sequence for index, cluster_idx_sequence in
                                        enumerate(cluster_idx_sequence_list) if index in choice_index]
 
-    return sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_sequence_list_valid, cluster_idx_sequence_list_valid
+    sentiment_result_list_train = [sentiment_sequence[0] for sentiment_sequence in sentiment_sequence_list_train]
+    sentiment_result_list_valid = [sentiment_sequence[0] for sentiment_sequence in sentiment_sequence_list_valid]
+
+    from torch.nn.utils.rnn import pack_sequence
+    packed = pack_sequence(cluster_idx_sequence_list_train, enforce_sorted=False)
+
+    from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+    seq_unpacked, lens_unpacked = pad_packed_sequence(packed, batch_first=True)
+
+    from torch.nn.utils.rnn import pad_sequence
+    padded = pad_sequence(cluster_idx_sequence_list_train, batch_first=True)
+
+    return (
+        sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
+        sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
+    )
 
 
 def model_pipline(sentiment_sequence, cluster_idx_sequence):
-    embedding_input = 7
+    embedding_input = 9
     embedding_dimension = 5
     lstm_hidden_dimension = 6
 
@@ -103,24 +119,47 @@ class Model(nn.Module):
         self.lstm_layer = nn.LSTM(embedding_dimension + 1, lstm_hidden_dimension, batch_first=True)
         self.linear_layer = nn.Linear(lstm_hidden_dimension + embedding_dimension, 1)
 
-    def forward(self, sentiment_sequence_tensor, cluster_idx_sequence):
-        cluster_embedding_sequence_tensor = self.embedding_layer(cluster_idx_sequence)
-        cat_tensor = torch.cat((sentiment_sequence_tensor, cluster_embedding_sequence_tensor), dim=-1)
+    def forward(self, sentiment_sequence_list, cluster_idx_sequence_list):
+        # 分离输入。
+        # 去除情感序列最后一列
+        sentiment_sequence_list = [sentiment_sequence_tensor[:-1] for sentiment_sequence_tensor in
+                                   sentiment_sequence_list]
+        # 去除cluster序列最后一列，
+        cluster_idx_sequence_list = [cluster_idx_sequence_tensor[:-1] for cluster_idx_sequence_tensor in
+                                     cluster_idx_sequence_list]
+        # 提取cluster序列最后一列，转为张量，进行嵌入
+        cluster_idx_last_list = [cluster_idx_sequence_tensor[-1] for cluster_idx_sequence_tensor in
+                                 cluster_idx_sequence_list]
+        cluster_idx_last = tensor(cluster_idx_last_list)
+        linear_input_embedding = self.embedding_layer(cluster_idx_last)
 
-        lstm_input_tensor = cat_tensor[:, :-1, :]
-        linear_input_embedding = cluster_embedding_sequence_tensor[:, [-1], :]
+        # 获取序列长度
+        seq_len = [len(sentiment_sequence_tensor) for sentiment_sequence_tensor in sentiment_sequence_list]
 
-        lstm_out, (lstm_hidden, lstm_cell) = self.lstm_layer(lstm_input_tensor)
-        linear_out = self.linear_layer(torch.cat([lstm_hidden, linear_input_embedding], dim=-1).flatten(1))
+        # padding + embedding
+        sentiment_padded_sequence = pad_sequence(sentiment_sequence_list, batch_first=True)
+        cluster_idx_padded_sequence = pad_sequence(cluster_idx_sequence_list, batch_first=True)
+        cluster_embedding_padded_sequence = self.embedding_layer(cluster_idx_padded_sequence)
+
+        # concatenate + pack
+        cat_padded_tensor = torch.cat(
+            (sentiment_padded_sequence, cluster_embedding_padded_sequence),
+            dim=-1
+        )
+        cat_packed_tensor = pack_padded_sequence(cat_padded_tensor, seq_len, batch_first=True)
+
+        lstm_out, (lstm_hidden, lstm_cell) = self.lstm_layer(cat_packed_tensor)
+        linear_input = torch.cat([lstm_hidden, linear_input_embedding], dim=-1).flatten(1)
+        linear_out = self.linear_layer(linear_input)
 
         return linear_out
 
 
 def train(
-        sentiment_sequence_list, cluster_idx_sequence_list,
-        sentiment_sequence_list_valid, cluster_idx_sequence_list_valid,
+        sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
+        sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
 ):
-    embedding_input = 7
+    embedding_input = 9
     embedding_dimension = 5
     lstm_hidden_dimension = 6
 
@@ -133,38 +172,22 @@ def train(
 
     def model_evaluate():
         from sklearn.metrics import r2_score
-
-        y_true_list = []
-        y_predict_list = []
         with torch.no_grad():
-            for sentiment_sequence, cluster_idx_sequence in zip(sentiment_sequence_list_valid,
-                                                                cluster_idx_sequence_list_valid):
-                output = model(sentiment_sequence.view(1, -1, 1), cluster_idx_sequence.view(1, -1))
-
-                y_true_list.append(sentiment_sequence[-1])
-                y_predict_list.append(output[0][0])
-
+            y_predict_list = model(sentiment_sequence_list_valid, cluster_idx_sequence_list_valid)
+        y_true_list = sentiment_result_list_valid
         r2 = r2_score(y_true_list, y_predict_list)
         print(r2)
         return r2
 
     for epoch in range(500):
-        running_loss = 0
-        for index, (sentiment_sequence, cluster_idx_sequence) in enumerate(
-                zip(sentiment_sequence_list, cluster_idx_sequence_list)):
-            optimizer.zero_grad()
-            output = model(sentiment_sequence.view(1, -1, 1), cluster_idx_sequence.view(1, -1))
-            loss = loss_func(output, sentiment_sequence[-1].view(1, 1))
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        output = model(sentiment_sequence_list_train, cluster_idx_sequence_list_train)
+        loss = loss_func(output, sentiment_result_list_train)
+        loss_sum = loss.sum()
+        loss_sum.backward()
+        optimizer.step()
 
-            # print statistics
-            running_loss += loss.item()
-            if index % 500 == 499:  # print every 2000 mini-batches
-                print('[%d, %5d] loss: %.3f' %
-                      (epoch + 1, index + 1, running_loss / 500))
-                running_loss = 0.0
-
+        print(f'loss in epoch {epoch}: {loss.average().item()}')
         print('evaluate:')
         model_evaluate()
         scheduler.step()
