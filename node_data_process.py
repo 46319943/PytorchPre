@@ -41,7 +41,7 @@ def data_filter():
     np.sum((df_route_length >= 4) & (df_route_length <= 15)) / route_count
 
     # 路线筛选
-    route_id_include = df_route_length[(df_route_length >= 4) & (df_route_length <= 15)].index.values
+    route_id_include = df_route_length[(df_route_length >= 4) & (df_route_length <= 9)].index.values
     df = df[df['route_id'].isin(route_id_include)]
     return df
 
@@ -131,7 +131,9 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.embedding_layer = nn.Embedding(embedding_input, embedding_dimension)
         self.lstm_layer = nn.LSTM(embedding_dimension + 1, lstm_hidden_dimension, num_layers, batch_first=True)
-        self.linear_layer = nn.Linear(lstm_hidden_dimension * num_layers + embedding_dimension, 1)
+        self.linear_layer1 = nn.Linear(lstm_hidden_dimension * num_layers + embedding_dimension, lstm_hidden_dimension * num_layers + embedding_dimension)
+        self.linear_layer2 = nn.Linear(lstm_hidden_dimension * num_layers + embedding_dimension, 1)
+
 
     def forward(self, sentiment_sequence_list, cluster_idx_sequence_list):
         # 分离输入。
@@ -165,26 +167,28 @@ class Model(nn.Module):
         lstm_out, (lstm_hidden, lstm_cell) = self.lstm_layer(cat_packed_tensor)
 
         linear_input = torch.cat([lstm_hidden.permute(1, 0, 2).flatten(-2), linear_input_embedding], dim=-1).flatten(1)
-        linear_out = self.linear_layer(linear_input)
+        linear_out1 = self.linear_layer1(linear_input)
+        linear_out2 = self.linear_layer2(linear_out1)
 
-        return linear_out
+        return linear_out2
 
 
 def train(
         sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
         sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
 ):
-    embedding_input = 9
-    embedding_dimension = 5
-    lstm_hidden_dimension = 6
-    num_layers = 1
+    # embedding_input = 9
+    embedding_input = 768
+    embedding_dimension = 3
+    lstm_hidden_dimension = embedding_dimension + 1
+    num_layers = 4
 
     model = Model(embedding_input, embedding_dimension, lstm_hidden_dimension, num_layers)
     model.to(device)
 
     # optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     optimizer = adabound.AdaBound(model.parameters(), lr=1e-3, final_lr=0.1)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 400)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 150)
     loss_func = nn.MSELoss()
 
     y_true_valid = tensor(sentiment_result_list_valid)
@@ -193,12 +197,19 @@ def train(
         from sklearn.metrics import r2_score
         with torch.no_grad():
             y_predict_list = model(sentiment_sequence_list_valid, cluster_idx_sequence_list_valid)
-        r2 = r2_score(y_true_valid, y_predict_list.cpu())
+            y_predict_list = y_predict_list.flatten().cpu()
+        r2 = r2_score(y_true_valid, y_predict_list)
         print(r2)
+
+        # r_abs = y_true_valid - y_predict_list
+        # i_inspect = r_abs > 0.3
+        # sequence_inspect = [sentiment_sequence for idx, sentiment_sequence in enumerate(sentiment_sequence_list_valid)
+        #                     if i_inspect[idx]]
+
         return r2
 
     y_true = tensor(sentiment_result_list_train, device=device).unsqueeze(-1)
-    for epoch in range(1600):
+    for epoch in range(1000):
         optimizer.zero_grad()
         output = model(sentiment_sequence_list_train, cluster_idx_sequence_list_train)
         loss = loss_func(output, y_true)
@@ -220,6 +231,13 @@ def main():
         sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
         sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
     ) = preprocess(df)
+
+    from CTrip_trace import load_data
+    (
+        sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
+        sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
+    ) = load_data()
+
     train(
         sentiment_sequence_list_train, cluster_idx_sequence_list_train, sentiment_result_list_train,
         sentiment_sequence_list_valid, cluster_idx_sequence_list_valid, sentiment_result_list_valid
